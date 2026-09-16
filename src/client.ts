@@ -6,6 +6,10 @@
  *   WP_API_PASSWORD - WordPress application password
  */
 
+import type { ResolvedFile } from "./upload.js";
+
+const USER_AGENT = "mcp-wordpress/1.1";
+
 export class WordPressError extends Error {
   constructor(
     message: string,
@@ -31,17 +35,21 @@ function getConfig(): { baseUrl: string; authHeader: string } {
   return { baseUrl, authHeader };
 }
 
-async function request<T>(
-  method: string,
-  path: string,
-  body?: unknown,
-  params?: Record<string, string | number | boolean | undefined>,
-): Promise<T> {
+type QueryParams = Record<string, string | number | boolean | undefined>;
+
+interface SendOptions {
+  params?: QueryParams;
+  body?: string | Uint8Array;
+  /** Merged over the defaults, so an upload can replace `Content-Type`. */
+  headers?: Record<string, string>;
+}
+
+async function send<T>(method: string, path: string, options: SendOptions = {}): Promise<T> {
   const { baseUrl, authHeader } = getConfig();
 
   let url = `${baseUrl}/wp-json/wp/v2${path}`;
-  if (params) {
-    const qs = Object.entries(params)
+  if (options.params) {
+    const qs = Object.entries(options.params)
       .filter(([, v]) => v !== undefined)
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
       .join("&");
@@ -50,14 +58,16 @@ async function request<T>(
 
   const headers: Record<string, string> = {
     Authorization: authHeader,
-    "Content-Type": "application/json",
-    "User-Agent": "mcp-wordpress/1.0",
+    "User-Agent": USER_AGENT,
+    ...options.headers,
   };
 
   const response = await fetch(url, {
     method,
     headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    // A Uint8Array is a valid body at runtime; the DOM lib types `BufferSource`
+    // as ArrayBuffer-backed only, which `Uint8Array<ArrayBufferLike>` is not.
+    body: options.body as BodyInit | undefined,
   });
 
   const text = await response.text();
@@ -77,6 +87,20 @@ async function request<T>(
   }
 
   return json as T;
+}
+
+/** JSON in, JSON out — the shape every endpoint but the media upload uses. */
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  params?: QueryParams,
+): Promise<T> {
+  return send<T>(method, path, {
+    params,
+    headers: { "Content-Type": "application/json" },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
 }
 
 // ── Posts ──────────────────────────────────────────────────────────────────
@@ -190,10 +214,38 @@ export interface Media {
   link: string;
 }
 
+export interface MediaMetadata {
+  title?: string;
+  alt_text?: string;
+  caption?: string;
+  description?: string;
+  /** Post or page ID to attach the file to. */
+  post?: number;
+  author?: number;
+}
+
 export const media = {
   list: (params?: { page?: number; per_page?: number; search?: string; media_type?: string }) =>
     request<Media[]>("GET", "/media", undefined, params as Record<string, string | number | boolean | undefined>),
   get: (id: number) => request<Media>("GET", `/media/${id}`),
+  /**
+   * Uploads a file to the media library.
+   *
+   * WordPress takes the bytes as the raw request body, named by
+   * `Content-Disposition` and typed by `Content-Type`. Because the body is the
+   * file itself, it cannot also carry JSON attributes — title, alt text and the
+   * rest travel as query parameters, which `create_item` reads from the request
+   * just the same.
+   */
+  create: (file: ResolvedFile, metadata: MediaMetadata = {}) =>
+    send<Media>("POST", "/media", {
+      params: metadata as QueryParams,
+      headers: {
+        "Content-Type": file.mimeType,
+        "Content-Disposition": `attachment; filename="${file.filename}"`,
+      },
+      body: file.bytes,
+    }),
   update: (id: number, data: { title?: string; alt_text?: string; caption?: string; description?: string }) =>
     request<Media>("POST", `/media/${id}`, data),
   delete: (id: number, force = false) => request<{ deleted: boolean }>("DELETE", `/media/${id}`, undefined, { force }),
