@@ -6,7 +6,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for the WordP
 
 - **Posts** — list, get, create, update, delete
 - **Pages** — list, get, create, update, delete
-- **Media** — list, get, update metadata, delete
+- **Media** — list, get, upload, update metadata, delete
 - **Categories** — list, create, update, delete
 - **Tags** — list, create, update, delete
 - **Comments** — list, create, update, delete
@@ -82,6 +82,7 @@ Add to your `claude_desktop_config.json`:
 | `delete_page` | Delete or trash a page |
 | `list_media` | List media library items |
 | `get_media` | Get a single media item |
+| `create_media` | Upload a file to the media library |
 | `update_media` | Update media metadata (alt text, caption, etc.) |
 | `delete_media` | Permanently delete a media item |
 | `list_categories` | List categories |
@@ -100,6 +101,44 @@ Add to your `claude_desktop_config.json`:
 | `get_current_user` | Get the authenticated user |
 | `get_site_settings` | Get site title, description, timezone, etc. |
 | `update_site_settings` | Update site settings |
+
+## Uploading media
+
+`create_media` takes the file one of two ways — exactly one per call:
+
+```jsonc
+// from a public URL: the server downloads it, then uploads it
+{ "source_url": "https://example.com/chart.png", "alt_text": "Quarterly revenue" }
+
+// from bytes you already hold, base64-encoded (a data: URI works too)
+{ "data_base64": "iVBORw0KGgo…", "filename": "chart.png", "title": "Q3 chart" }
+```
+
+`filename` and `mime_type` are inferred where possible — from the URL, the
+response headers, or each other — and WordPress rejects a file whose extension
+it does not allow, so pass them when the source is ambiguous. `title`,
+`alt_text`, `caption`, `description`, `post` and `author` are optional.
+
+The call returns the media item. Use its `id` as `featured_media` on
+`create_post` / `update_post` to set a featured image, or its `source_url` to
+embed the file in post content.
+
+Two limits worth knowing: uploads are capped at 25MB (and by whatever the site
+itself allows), and a `source_url` must resolve to a public address — loopback,
+private-range and link-local hosts are refused, since the server fetching them
+may sit inside a private network.
+
+## Development
+
+```bash
+npm install
+npm run build
+
+# End-to-end check against a scratch WordPress site (it writes media and one
+# draft post, and needs pretty permalinks enabled for /wp-json/ to route):
+WP_API_URL=http://localhost:8099 WP_API_USERNAME=admin \
+  WP_API_PASSWORD="xxxx xxxx xxxx xxxx xxxx xxxx" npm run smoke:media
+```
 
 ## License
 

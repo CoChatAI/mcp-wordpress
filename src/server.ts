@@ -6,6 +6,7 @@ import {
   type CallToolRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import * as wp from "./client.js";
+import { resolveSource } from "./upload.js";
 
 function text(content: string) {
   return { content: [{ type: "text" as const, text: content }] };
@@ -210,6 +211,38 @@ const TOOLS: Tool[] = [
       type: "object",
       properties: { id: { type: "number" } },
       required: ["id"],
+    },
+  },
+  {
+    name: "create_media",
+    description:
+      "Upload a file to the WordPress media library. Give it either source_url (the file is downloaded from a public http/https URL) or data_base64 (the file's bytes, base64-encoded) — exactly one of the two. Returns the created media item; use its id as featured_media on create_post/update_post, or its source_url to embed the file in post content.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_url: {
+          type: "string",
+          description: "Public http(s) URL to download the file from. Private, loopback and link-local addresses are refused.",
+        },
+        data_base64: {
+          type: "string",
+          description: "File contents as base64 (a data: URI is also accepted). Use for files you already hold as bytes.",
+        },
+        filename: {
+          type: "string",
+          description: "Filename to store, e.g. 'chart.png'. Required with data_base64 unless mime_type is given; inferred from the URL otherwise. WordPress rejects files whose extension it does not allow.",
+        },
+        mime_type: {
+          type: "string",
+          description: "MIME type, e.g. 'image/png'. Inferred from the response or the filename extension when omitted.",
+        },
+        title: { type: "string", description: "Media title (defaults to the filename)" },
+        alt_text: { type: "string", description: "Alternative text for accessibility" },
+        caption: { type: "string", description: "Media caption" },
+        description: { type: "string", description: "Media description" },
+        post: { type: "number", description: "Post or page ID to attach the file to" },
+        author: { type: "number", description: "Author user ID" },
+      },
     },
   },
   {
@@ -452,7 +485,7 @@ const TOOLS: Tool[] = [
 
 export function createServer(): Server {
   const server = new Server(
-    { name: "mcp-wordpress", version: "1.0.0" },
+    { name: "mcp-wordpress", version: "1.1.0" },
     { capabilities: { tools: {} } },
   );
 
@@ -497,6 +530,26 @@ export function createServer(): Server {
           return ok(await wp.media.list(a as Parameters<typeof wp.media.list>[0]));
         case "get_media":
           return ok(await wp.media.get(Number(a.id)));
+        case "create_media": {
+          const file = await resolveSource({
+            source_url: a.source_url as string | undefined,
+            data_base64: a.data_base64 as string | undefined,
+            filename: a.filename as string | undefined,
+            mime_type: a.mime_type as string | undefined,
+          });
+          // Named one by one rather than spread: everything here becomes a
+          // query parameter, and an unadvertised key (a `status` borrowed from
+          // create_post, say) would reach WordPress as an invalid one.
+          const metadata: wp.MediaMetadata = {
+            title: a.title as string | undefined,
+            alt_text: a.alt_text as string | undefined,
+            caption: a.caption as string | undefined,
+            description: a.description as string | undefined,
+            post: a.post === undefined ? undefined : Number(a.post),
+            author: a.author === undefined ? undefined : Number(a.author),
+          };
+          return ok(await wp.media.create(file, metadata));
+        }
         case "update_media": {
           const { id, ...data } = a;
           return ok(await wp.media.update(Number(id), data as Parameters<typeof wp.media.update>[1]));
