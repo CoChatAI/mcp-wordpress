@@ -26,6 +26,10 @@ export const FETCH_TIMEOUT_MS = 30_000;
 
 const MAX_REDIRECTS = 5;
 
+/** Well under the 255 most filesystems allow, leaving WordPress room for its
+ *  own `-scaled` / `-300x200` suffixes. */
+const MAX_FILENAME_LENGTH = 200;
+
 /** Extension ↔ MIME for the types WordPress accepts by default. Used in both
  *  directions: to name a file the response only described by Content-Type, and
  *  to type a file the caller only named. */
@@ -297,13 +301,17 @@ function decodeBase64(input: string): Uint8Array {
     throw new Error("data_base64 is not valid base64");
   }
 
-  const bytes = new Uint8Array(Buffer.from(data, "base64"));
-  if (bytes.length > MAX_UPLOAD_BYTES) {
+  // Size it from the text before decoding: the payload is caller-controlled,
+  // and decoding first would allocate the whole thing just to refuse it.
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  const decodedLength = (data.length / 4) * 3 - padding;
+  if (decodedLength > MAX_UPLOAD_BYTES) {
     throw new Error(
-      `data_base64 decodes to ${bytes.length} bytes, above the ${MAX_UPLOAD_BYTES}-byte upload limit`,
+      `data_base64 decodes to ${decodedLength} bytes, above the ${MAX_UPLOAD_BYTES}-byte upload limit`,
     );
   }
-  return bytes;
+  // A Buffer is a Uint8Array; wrapping it would copy the bytes a second time.
+  return Buffer.from(data, "base64");
 }
 
 /** `image/png; charset=binary` → `image/png`. */
@@ -354,8 +362,13 @@ export function sanitizeFilename(name: string): string {
     .replace(/["'`;\\]/g, "_")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 200);
-  return safe.replace(/^\.+/, "") || "upload";
+    .replace(/^\.+/, "");
+  if (safe.length <= MAX_FILENAME_LENGTH) return safe || "upload";
+  // Cut the stem, never the extension — it is what WordPress judges the file by.
+  const dot = safe.lastIndexOf(".");
+  const extension = dot > 0 ? safe.slice(dot) : "";
+  const stem = dot > 0 ? safe.slice(0, dot) : safe;
+  return stem.slice(0, MAX_FILENAME_LENGTH - extension.length) + extension;
 }
 
 /**
@@ -380,11 +393,11 @@ export async function resolveSource(input: ResolveSourceInput): Promise<Resolved
     const remote = await fetchRemote(source);
     bytes = remote.bytes;
     // An explicit argument wins; `application/octet-stream` is what a server
-    // says when it does not know, so it loses to anything the name implies.
+    // says when it does not know, so it is left unset and the filename's
+    // extension gets to answer instead.
     const served = normalizeMime(remote.contentType);
     if (!mime && served && served !== "application/octet-stream") mime = served;
     filename ??= filenameFromDisposition(remote.disposition) ?? filenameFromUrl(remote.finalUrl);
-    if (!mime) mime = served;
   } else {
     const source = input.data_base64!;
     bytes = decodeBase64(source);

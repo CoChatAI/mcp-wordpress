@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 for (const key of ["WP_API_URL", "WP_API_USERNAME", "WP_API_PASSWORD"]) {
   if (!process.env[key]) {
@@ -151,6 +152,21 @@ try {
   check("follows redirects", Number.isInteger(item.id), `${item.source_url} (${item.mime_type})`);
 } catch {
   check("follows redirects", false, redirected.slice(0, 300));
+}
+
+// A server that types a file as application/octet-stream knows nothing; the
+// name has to answer instead. No CDN serves a PNG that way on purpose, so this
+// asks an echo service for exactly those headers and checks the resolver
+// directly — the body is not a PNG, so it never goes to WordPress.
+const { resolveSource } = await import(pathToFileURL(join(repoRoot, "dist/upload.js")).href);
+try {
+  const resolved = await resolveSource({
+    source_url:
+      "https://httpbin.org/response-headers?Content-Type=application/octet-stream&Content-Disposition=attachment%3B%20filename%3D%22chart.png%22",
+  });
+  check("octet-stream yields to the filename's extension", resolved.mimeType === "image/png" && resolved.filename === "chart.png", `${resolved.mimeType} ${resolved.filename}`);
+} catch (e) {
+  check("octet-stream yields to the filename's extension", false, e.message);
 }
 
 // ── guards ────────────────────────────────────────────────────────────────
