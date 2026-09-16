@@ -166,11 +166,27 @@ check("refuses instance metadata", /private address/.test(imds), imds.slice(0, 1
 const loopback = await callText("create_media", { source_url: "http://localhost:8099/favicon.ico" });
 check("refuses loopback", /private address/.test(loopback), loopback.slice(0, 160));
 
+const hexMapped = await callText("create_media", { source_url: "http://[::ffff:7f00:1]:8099/favicon.ico" });
+check("refuses an IPv4-mapped literal in hex form", /private address/.test(hexMapped), hexMapped.slice(0, 160));
+
+const linkLocal6 = await callText("create_media", { source_url: "http://[fe90::1]/x.png" });
+check("refuses the whole fe80::/10 range", /private address/.test(linkLocal6), linkLocal6.slice(0, 160));
+
+// A public DNS name that answers with a private address: the refusal has to
+// come from the connection's own resolver, not a check that ran before it.
+const rebound = await callText("create_media", { source_url: "http://localtest.me:8099/favicon.ico" });
+check("refuses a name that resolves to a private address", /resolves to a private address/.test(rebound), rebound.slice(0, 160));
+
 const ftp = await callText("create_media", { source_url: "ftp://example.com/x.png" });
 check("refuses non-http scheme", /must be http or https/.test(ftp), ftp.slice(0, 160));
 
 const badB64 = await callText("create_media", { data_base64: "not base64!!", filename: "x.png" });
 check("rejects invalid base64", /not valid base64/.test(badB64), badB64.slice(0, 160));
+
+const dataUri = JSON.parse(
+  await callText("create_media", { data_base64: `data:IMAGE/PNG;charset=utf-8;base64,${PNG_B64}`, title: "Data URI" }),
+);
+check("data: URI with parameters and upper-case type", dataUri.mime_type === "image/png" && /\.png$/.test(dataUri.source_url ?? ""), `${dataUri.mime_type} ${dataUri.source_url}`);
 
 const noType = await callText("create_media", { data_base64: PNG_B64 });
 check("asks for a type when none can be inferred", /could not determine the file type/.test(noType), noType.slice(0, 160));

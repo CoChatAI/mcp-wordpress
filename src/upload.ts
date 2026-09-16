@@ -7,7 +7,10 @@
  */
 
 import { lookup } from "node:dns/promises";
-import { isIPv4 } from "node:net";
+import type { LookupAddress, LookupOptions } from "node:dns";
+import { BlockList, isIP } from "node:net";
+
+import { Agent, fetch as undiciFetch } from "undici";
 
 import { USER_AGENT } from "./client.js";
 
@@ -80,65 +83,90 @@ export interface ResolvedFile {
   mimeType: string;
 }
 
-/** True for an address that only exists inside a network — loopback, the
- *  RFC1918 ranges, link-local (169.254.169.254 among them) and the rest. */
+/**
+ * Addresses the server must never fetch on a caller's behalf: loopback, the
+ * RFC1918 ranges, link-local (169.254.169.254 among them), unique-local IPv6
+ * and the reserved blocks. `BlockList` canonicalises before it compares, so an
+ * IPv4-mapped IPv6 literal in either spelling (`::ffff:127.0.0.1`,
+ * `::ffff:7f00:1`) is judged by its embedded IPv4 rules, and each prefix
+ * covers its whole range (`fe80::/10` is `fe80` through `febf`).
+ */
+const PRIVATE_ADDRESSES = new BlockList();
+for (const [address, prefix] of [
+  ["0.0.0.0", 8], // "this network"
+  ["10.0.0.0", 8], // RFC1918
+  ["100.64.0.0", 10], // CGNAT
+  ["127.0.0.0", 8], // loopback
+  ["169.254.0.0", 16], // link-local, incl. cloud instance metadata
+  ["172.16.0.0", 12], // RFC1918
+  ["192.168.0.0", 16], // RFC1918
+  ["198.18.0.0", 15], // benchmarking
+  ["224.0.0.0", 3], // multicast + reserved
+] as const) {
+  PRIVATE_ADDRESSES.addSubnet(address, prefix, "ipv4");
+}
+for (const [address, prefix] of [
+  ["::", 128], // unspecified
+  ["::1", 128], // loopback
+  ["fe80::", 10], // link-local
+  ["fc00::", 7], // unique local
+] as const) {
+  PRIVATE_ADDRESSES.addSubnet(address, prefix, "ipv6");
+}
+
 function isPrivateAddress(ip: string): boolean {
-  if (isIPv4(ip)) {
-    const [a, b] = ip.split(".").map(Number);
-    return (
-      a === 0 || // "this network"
-      a === 10 || // RFC1918
-      a === 127 || // loopback
-      (a === 100 && b >= 64 && b <= 127) || // CGNAT
-      (a === 169 && b === 254) || // link-local, incl. cloud instance metadata
-      (a === 172 && b >= 16 && b <= 31) || // RFC1918
-      (a === 192 && b === 168) || // RFC1918
-      (a === 198 && (b === 18 || b === 19)) || // benchmarking
-      a >= 224 // multicast + reserved
-    );
-  }
-
-  const v6 = ip.toLowerCase().replace(/^\[|\]$/g, "").split("%")[0];
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(v6);
-  if (mapped) return isPrivateAddress(mapped[1]);
-
-  return (
-    v6 === "::" ||
-    v6 === "::1" ||
-    v6.startsWith("fe80") || // link-local
-    v6.startsWith("fc") || // unique local
-    v6.startsWith("fd") // unique local
-  );
+  const family = isIP(ip);
+  if (family === 0) return false;
+  return PRIVATE_ADDRESSES.check(ip, family === 4 ? "ipv4" : "ipv6");
 }
 
 /**
- * Refuses an address the server should never fetch on a caller's behalf.
- * `source_url` can arrive from an untrusted place — a page the model read, a
- * user's paste — and the server may sit inside a private network where
- * loopback, RFC1918 and the cloud instance-metadata endpoint are reachable.
- *
- * This resolves the name and `fetch` resolves it again, so a host answering
- * differently between the two lookups (DNS rebinding) can still slip past.
- * Closing that needs a pinned `connect.lookup` on a custom undici Agent; this
- * stops the straightforward cases, not a determined rebind.
+ * The resolver the fetch agent connects through. It is the SSRF check itself,
+ * not a preflight for one: the address it hands back is the address the
+ * socket opens to, so a host cannot answer the check with a public address
+ * and the connection with a private one (DNS rebinding). TLS still verifies
+ * against the hostname — only the resolution is pinned.
  */
-async function assertPublicHttpUrl(url: URL): Promise<void> {
+function guardedLookup(
+  hostname: string,
+  options: LookupOptions,
+  callback: (err: Error | null, address: string | LookupAddress[], family?: number) => void,
+): void {
+  const { all, ...rest } = options;
+  lookup(hostname, { ...rest, all: true }).then(
+    (addresses) => {
+      const blocked = addresses.find((a) => isPrivateAddress(a.address));
+      if (blocked) {
+        return callback(
+          new Error(
+            `source_url resolves to a private address (${blocked.address}); only public hosts can be uploaded from`,
+          ),
+          "",
+        );
+      }
+      if (all) return callback(null, addresses);
+      const [first] = addresses;
+      callback(null, first.address, first.family);
+    },
+    (err: Error) => callback(err, ""),
+  );
+}
+
+const publicOnlyAgent = new Agent({ connect: { lookup: guardedLookup } });
+
+/**
+ * The part of the check a lookup never sees: the scheme, and a host that is
+ * already an IP literal — `net.connect` skips resolution for those, so
+ * {@link guardedLookup} would never run.
+ */
+function assertPublicHttpUrl(url: URL): void {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error(`source_url must be http or https, got "${url.protocol}"`);
   }
-
   const host = url.hostname.replace(/^\[|\]$/g, "");
-  let addresses: { address: string }[];
-  try {
-    addresses = await lookup(host, { all: true });
-  } catch {
-    throw new Error(`source_url host "${url.hostname}" could not be resolved`);
-  }
-
-  const blocked = addresses.find((a) => isPrivateAddress(a.address));
-  if (blocked) {
+  if (isPrivateAddress(host)) {
     throw new Error(
-      `source_url resolves to a private address (${blocked.address}); only public hosts can be uploaded from`,
+      `source_url points at a private address (${host}); only public hosts can be uploaded from`,
     );
   }
 }
@@ -203,17 +231,21 @@ async function fetchRemote(
   const signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    await assertPublicHttpUrl(url);
+    assertPublicHttpUrl(url);
 
     let response: Response;
     try {
-      response = await fetch(url, {
+      response = (await undiciFetch(url, {
+        dispatcher: publicOnlyAgent,
         redirect: "manual",
         signal,
         headers: { "User-Agent": USER_AGENT, Accept: "*/*" },
-      });
+      })) as unknown as Response;
     } catch (e) {
-      const reason = e instanceof Error ? e.message : String(e);
+      // undici reports every failure as "fetch failed" and keeps the reason —
+      // the guarded lookup's refusal included — in `cause`.
+      const cause = e instanceof Error && e.cause instanceof Error ? e.cause : e;
+      const reason = cause instanceof Error ? cause.message : String(cause);
       throw new Error(`fetching ${url.href} failed: ${reason}`);
     }
 
@@ -244,9 +276,22 @@ async function fetchRemote(
   throw new Error(`source_url redirected more than ${MAX_REDIRECTS} times`);
 }
 
+/** `data:image/png;charset=utf-8;base64,` → `{ mime: "image/png", payload }`
+ *  (any case; parameters between the type and `;base64` are allowed). A
+ *  string that is not a data URI comes back as the payload unchanged. */
+function splitDataUri(input: string): { mime?: string; payload: string } {
+  const match = /^data:([^,]*),/i.exec(input);
+  if (!match) return { payload: input };
+  const [type, ...params] = match[1].split(";");
+  if (!params.some((p) => p.trim().toLowerCase() === "base64")) {
+    throw new Error("data_base64 is a data: URI without the ;base64 marker");
+  }
+  return { mime: type.trim().toLowerCase() || undefined, payload: input.slice(match[0].length) };
+}
+
 function decodeBase64(input: string): Uint8Array {
   // Accept a data: URI as well as bare base64 — callers paste both.
-  const data = input.replace(/^data:[^;,]*;base64,/, "").replace(/\s+/g, "");
+  const data = splitDataUri(input).payload.replace(/\s+/g, "");
   if (!data) throw new Error("data_base64 is empty");
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(data) || data.length % 4 !== 0) {
     throw new Error("data_base64 is not valid base64");
@@ -259,10 +304,6 @@ function decodeBase64(input: string): Uint8Array {
     );
   }
   return bytes;
-}
-
-function mimeFromDataUri(input: string): string | undefined {
-  return /^data:([^;,]+);base64,/.exec(input)?.[1];
 }
 
 /** `image/png; charset=binary` → `image/png`. */
@@ -347,7 +388,7 @@ export async function resolveSource(input: ResolveSourceInput): Promise<Resolved
   } else {
     const source = input.data_base64!;
     bytes = decodeBase64(source);
-    mime ??= normalizeMime(mimeFromDataUri(source));
+    mime ??= splitDataUri(source).mime;
   }
 
   if (bytes.length === 0) throw new Error("the file is empty — nothing to upload");
