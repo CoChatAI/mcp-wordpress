@@ -143,6 +143,16 @@ if (remoteMedia) {
   check("remote mime detected", remoteMedia.mime_type === "image/png", remoteMedia.mime_type);
 }
 
+// A URL that 302s: exercises the hand-rolled redirect loop and shows the
+// filename coming from the FINAL hop, not the one the caller gave.
+const redirected = await callText("create_media", { source_url: "https://picsum.photos/200" });
+try {
+  const item = JSON.parse(redirected);
+  check("follows redirects", Number.isInteger(item.id), `${item.source_url} (${item.mime_type})`);
+} catch {
+  check("follows redirects", false, redirected.slice(0, 300));
+}
+
 // ── guards ────────────────────────────────────────────────────────────────
 const both = await callText("create_media", { source_url: REMOTE, data_base64: PNG_B64 });
 check("rejects both sources", /exactly one of source_url or data_base64/.test(both), both.slice(0, 120));

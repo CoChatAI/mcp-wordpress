@@ -8,7 +8,7 @@
 
 import type { ResolvedFile } from "./upload.js";
 
-const USER_AGENT = "mcp-wordpress/1.1";
+export const USER_AGENT = "mcp-wordpress/1.1";
 
 export class WordPressError extends Error {
   constructor(

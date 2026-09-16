@@ -531,14 +531,24 @@ export function createServer(): Server {
         case "get_media":
           return ok(await wp.media.get(Number(a.id)));
         case "create_media": {
-          const { source_url, data_base64, filename, mime_type, ...metadata } = a;
           const file = await resolveSource({
-            source_url: source_url as string | undefined,
-            data_base64: data_base64 as string | undefined,
-            filename: filename as string | undefined,
-            mime_type: mime_type as string | undefined,
+            source_url: a.source_url as string | undefined,
+            data_base64: a.data_base64 as string | undefined,
+            filename: a.filename as string | undefined,
+            mime_type: a.mime_type as string | undefined,
           });
-          return ok(await wp.media.create(file, metadata as wp.MediaMetadata));
+          // Named one by one rather than spread: everything here becomes a
+          // query parameter, and an unadvertised key (a `status` borrowed from
+          // create_post, say) would reach WordPress as an invalid one.
+          const metadata: wp.MediaMetadata = {
+            title: a.title as string | undefined,
+            alt_text: a.alt_text as string | undefined,
+            caption: a.caption as string | undefined,
+            description: a.description as string | undefined,
+            post: a.post === undefined ? undefined : Number(a.post),
+            author: a.author === undefined ? undefined : Number(a.author),
+          };
+          return ok(await wp.media.create(file, metadata));
         }
         case "update_media": {
           const { id, ...data } = a;

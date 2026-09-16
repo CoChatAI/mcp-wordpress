@@ -9,6 +9,8 @@
 import { lookup } from "node:dns/promises";
 import { isIPv4 } from "node:net";
 
+import { USER_AGENT } from "./client.js";
+
 /** Largest file we will hand to WordPress. Sites impose their own (usually
  *  lower) limit via `upload_max_filesize`; this one only keeps a runaway
  *  download from filling the container's 512MB of memory. */
@@ -78,13 +80,8 @@ export interface ResolvedFile {
   mimeType: string;
 }
 
-/**
- * Rejects an address the proxy container should never fetch on a caller's
- * behalf. `source_url` can arrive from an untrusted place (a page the model
- * read, a user's paste), and the container sits on the EC2 host's network
- * where loopback, RFC1918 and the 169.254.169.254 instance-metadata endpoint
- * are all reachable.
- */
+/** True for an address that only exists inside a network — loopback, the
+ *  RFC1918 ranges, link-local (169.254.169.254 among them) and the rest. */
 function isPrivateAddress(ip: string): boolean {
   if (isIPv4(ip)) {
     const [a, b] = ip.split(".").map(Number);
@@ -114,6 +111,17 @@ function isPrivateAddress(ip: string): boolean {
   );
 }
 
+/**
+ * Refuses an address the server should never fetch on a caller's behalf.
+ * `source_url` can arrive from an untrusted place — a page the model read, a
+ * user's paste — and the server may sit inside a private network where
+ * loopback, RFC1918 and the cloud instance-metadata endpoint are reachable.
+ *
+ * This resolves the name and `fetch` resolves it again, so a host answering
+ * differently between the two lookups (DNS rebinding) can still slip past.
+ * Closing that needs a pinned `connect.lookup` on a custom undici Agent; this
+ * stops the straightforward cases, not a determined rebind.
+ */
 async function assertPublicHttpUrl(url: URL): Promise<void> {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error(`source_url must be http or https, got "${url.protocol}"`);
@@ -202,7 +210,7 @@ async function fetchRemote(
       response = await fetch(url, {
         redirect: "manual",
         signal,
-        headers: { "User-Agent": "mcp-wordpress/1.1", Accept: "*/*" },
+        headers: { "User-Agent": USER_AGENT, Accept: "*/*" },
       });
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
