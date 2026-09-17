@@ -605,15 +605,14 @@ function describeArgument(spec: Record<string, unknown>): string {
 /**
  * Whether an OPTIONS answer belongs to an index — the API root or a namespace
  * such as /wp/v2. An index's OPTIONS answer describes only itself; the routes
- * it lists come back from a GET.
+ * it lists come back from a GET. Every answer names the namespace its route
+ * belongs to, and only an index's route is that namespace itself ("" for the
+ * root) — an argument's name says nothing, since any endpoint may take one
+ * called `namespace`.
  */
 function isIndexRoute(route: string, options: unknown): boolean {
-  if (route === "/") return true;
-  const endpoints = (options as Record<string, unknown> | null)?.endpoints;
-  return (
-    Array.isArray(endpoints) &&
-    endpoints.some((endpoint) => Object.hasOwn((endpoint as Record<string, unknown>).args ?? {}, "namespace"))
-  );
+  const namespace = (options as Record<string, unknown> | null)?.namespace;
+  return typeof namespace === "string" && route.replace(/^\/+|\/+$/g, "") === namespace;
 }
 
 /** The OPTIONS answer boiled down to what a caller needs: the raw one carries

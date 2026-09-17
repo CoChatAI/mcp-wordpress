@@ -7,13 +7,13 @@
  *   WP_API_URL=http://localhost:8099 WP_API_USERNAME=admin \
  *     WP_API_PASSWORD="xxxx xxxx xxxx" node scripts/smoke-writes.mjs
  *
- * The site needs Yoast SEO active and these meta keys registered with
- * `show_in_rest` (scripts/fixtures/rest-meta.php does exactly that — drop it in
- * mu-plugins):
+ * The site needs Yoast SEO active and scripts/fixtures/smoke-mu-plugin.php in
+ * mu-plugins, which registers:
  *   post meta     _yoast_wpseo_focuskw, _yoast_wpseo_title, _yoast_wpseo_metadesc
  *                 (with an auth_callback) and _locked_without_callback (without)
  *   term meta     term_note
  *   comment meta  comment_note
+ *   routes        smoke/v1/* — redirects, an echo, an endpoint taking `namespace`
  *
  * It WRITES to the target site (posts, pages, media, terms, comments, and
  * settings it puts back), so point it at a scratch install, never a live one.
@@ -198,7 +198,22 @@ await attempt("wordpress_request", async () => {
   const notFound = await callText("wordpress_request", { method: "GET", path: "/wp/v2/no-such-route" });
   check("a missing route reports WordPress's 404", notFound.startsWith("Error 404") && notFound.includes("rest_no_route"), notFound.slice(0, 80));
 
+  // Repeated keys in an inline query string all arrive.
+  const repeated = await callJson("wordpress_request", { method: "GET", path: "/smoke/v1/echo?include[]=11&include[]=22&single=x" });
+  check("an inline query keeps every value of a repeated key", JSON.stringify(repeated.body?.query?.include) === JSON.stringify(["11", "22"]) && repeated.body?.query?.single === "x", JSON.stringify(repeated.body?.query));
+  const overridden = await callJson("wordpress_request", { method: "GET", path: "/smoke/v1/echo?include[]=11&include[]=22&single=x", query: JSON.stringify({ include: [33] }) });
+  check("an explicit query replaces the inline one, bracketed forms included", JSON.stringify(overridden.body?.query?.include) === JSON.stringify(["33"]) && overridden.body?.query?.single === "x", JSON.stringify(overridden.body?.query));
+
+  // Redirects: followed only while they stay in this site's REST API.
+  const hopped = await callJson("wordpress_request", { method: "GET", path: "/smoke/v1/to-echo" });
+  check("a redirect within the REST API is followed", hopped.status === 200 && hopped.body?.query?.hopped === "1", JSON.stringify(hopped.body));
+  const kept = await callJson("wordpress_request", { method: "POST", path: "/smoke/v1/write-307", body: JSON.stringify({ title: "kept" }) });
+  check("a 307 on a write is followed with its method and body", kept.body?.method === "POST" && kept.body?.body?.title === "kept", JSON.stringify(kept.body));
+
   for (const [label, args, pattern] of [
+    ["does not follow a redirect out of the REST API", { method: "GET", path: "/smoke/v1/to-login" }, /outside this site's REST API — not followed/],
+    ["refuses a redirect that would turn a write into a GET", { method: "POST", path: "/smoke/v1/write-302", body: "{}" }, /resend the request as a GET without its body, so nothing was written/],
+    ["stops a redirect loop", { method: "GET", path: "/smoke/v1/loop" }, /redirected more than 5 times/],
     ["refuses dot segments", { method: "GET", path: "/wp/v2/../../wp-login.php" }, /"\." or "\.\." segments/],
     ["refuses encoded dot segments", { method: "GET", path: "/wp/v2/%2e%2e/%2e%2e/wp-admin/" }, /"\." or "\.\." segments/],
     ["refuses a full URL", { method: "GET", path: "https://example.com/wp-json/wp/v2/posts" }, /not a URL/],
@@ -223,6 +238,9 @@ await attempt("get_endpoint_schema", async () => {
 
   const index = await callJson("get_endpoint_schema", { path: "/" });
   check("the API index lists namespaces and routes", Array.isArray(index.namespaces) && index.namespaces.includes("yoast/v1") && typeof index.routes?.["/wp/v2/posts"] === "string", `${index.namespaces?.length} namespaces, ${Object.keys(index.routes ?? {}).length} routes`);
+
+  const takesNamespace = await callJson("get_endpoint_schema", { path: "/smoke/v1/takes-namespace" });
+  check("an endpoint with a `namespace` argument is described, not called", typeof takesNamespace.methods?.GET?.namespace === "string" && takesNamespace.routes === undefined, JSON.stringify(takesNamespace).slice(0, 140));
 
   const namespace = await callJson("get_endpoint_schema", { path: "/yoast/v1" });
   check("a namespace index lists its routes", namespace.namespace === "yoast/v1" && Object.keys(namespace.routes ?? {}).some((r) => r.startsWith("/yoast/v1/")), `${Object.keys(namespace.routes ?? {}).length} routes`);

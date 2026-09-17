@@ -40,6 +40,9 @@ function getConfig(): { baseUrl: string; authHeader: string } {
 type QueryParams = Record<string, unknown>;
 
 interface SendOptions {
+  /** Query pairs sent exactly as written, ahead of `params` — a caller's
+   *  inline query string, where a key may repeat (`include[]=1&include[]=2`). */
+  rawQuery?: [string, string][];
   params?: QueryParams;
   body?: string | Uint8Array;
   /** Merged over the defaults, so an upload can replace `Content-Type`. */
@@ -63,23 +66,36 @@ function appendQuery(search: URLSearchParams, key: string, value: unknown): void
   }
 }
 
+const MAX_REDIRECTS = 5;
+
+/**
+ * Whether a URL belongs to the configured site's REST API: same host and port,
+ * the same scheme or an upgrade from http to https, and a path under /wp-json.
+ * The credentials are sent to such a URL and to nothing else.
+ */
+function isRestUrl(target: URL, root: URL): boolean {
+  const scheme = target.protocol === root.protocol || (root.protocol === "http:" && target.protocol === "https:");
+  return (
+    scheme &&
+    target.hostname === root.hostname &&
+    target.port === root.port &&
+    target.pathname.startsWith(`${root.pathname}/`)
+  );
+}
+
 /** One authenticated round trip to a route under `/wp-json`, throwing a
  *  {@link WordPressError} for any non-2xx answer. */
 async function exchange<T>(method: string, route: string, options: SendOptions = {}): Promise<Exchange<T>> {
   const { baseUrl, authHeader } = getConfig();
 
-  const root = `${baseUrl}/wp-json`;
-  let url = `${root}${route}`;
-  if (options.params) {
-    const search = new URLSearchParams();
-    for (const [key, value] of Object.entries(options.params)) appendQuery(search, key, value);
-    const qs = search.toString();
-    if (qs) url += `?${qs}`;
-  }
-  // The credentials go to this site's REST API and nowhere else on it:
-  // `parseRoute` refuses dot segments, and this catches anything that still
+  const root = new URL(`${baseUrl}/wp-json`);
+  let url = new URL(`${root.href}${route}`);
+  const search = new URLSearchParams(options.rawQuery ?? []);
+  for (const [key, value] of Object.entries(options.params ?? {})) appendQuery(search, key, value);
+  url.search = search.toString();
+  // `parseRoute` refuses dot segments; this catches anything that still
   // resolves outside /wp-json once the URL is normalised.
-  if (!new URL(url).pathname.startsWith(`${new URL(root).pathname}/`)) {
+  if (!isRestUrl(url, root)) {
     throw new Error(`route "${route}" resolves outside the REST API`);
   }
 
@@ -89,13 +105,44 @@ async function exchange<T>(method: string, route: string, options: SendOptions =
     ...options.headers,
   };
 
-  const response = await fetch(url, {
-    method,
-    headers,
-    // A Uint8Array is a valid body at runtime; the DOM lib types `BufferSource`
-    // as ArrayBuffer-backed only, which `Uint8Array<ArrayBufferLike>` is not.
-    body: options.body as BodyInit | undefined,
-  });
+  // Redirects are followed by hand. `fetch` would follow them itself and keep
+  // the Authorization header on any same-origin hop — to /wp-admin or
+  // /wp-login.php as readily as to another REST route.
+  let response: Response;
+  for (let hops = 0; ; hops++) {
+    response = await fetch(url, {
+      method,
+      headers,
+      // A Uint8Array is a valid body at runtime; the DOM lib types `BufferSource`
+      // as ArrayBuffer-backed only, which `Uint8Array<ArrayBufferLike>` is not.
+      body: options.body as BodyInit | undefined,
+      redirect: "manual",
+    });
+    const location = response.headers.get("location");
+    if (response.status < 300 || response.status >= 400 || location === null) break;
+
+    await response.body?.cancel().catch(() => {
+      /* the redirect's own body is never read */
+    });
+    const next = new URL(location, url);
+    const shown = `${next.origin}${next.pathname}`;
+    if (!isRestUrl(next, root)) {
+      throw new Error(
+        `${method} ${route} redirected to ${shown}, outside this site's REST API — not followed, so the credentials were not sent there. If the site has moved, set WP_API_URL to its new address.`,
+      );
+    }
+    // 301, 302 and 303 turn a write into a GET and drop its body: following
+    // one would report the GET's answer as if the write had happened.
+    if (response.status !== 307 && response.status !== 308 && !["GET", "HEAD", "OPTIONS"].includes(method)) {
+      throw new Error(
+        `${method} ${route} answered ${response.status} with a redirect to ${shown}; following it would resend the request as a GET without its body, so nothing was written. Set WP_API_URL to the address the site redirects to.`,
+      );
+    }
+    if (hops >= MAX_REDIRECTS) {
+      throw new Error(`${method} ${route} redirected more than ${MAX_REDIRECTS} times`);
+    }
+    url = next;
+  }
 
   const text = await response.text();
   let json: unknown;
@@ -470,7 +517,7 @@ export const settings = {
  * query string (returned separately), refuses full URLs and dot segments —
  * the site and its credentials are fixed, and so is the API they reach.
  */
-export function parseRoute(input: string): { route: string; query: Record<string, string> } {
+export function parseRoute(input: string): { route: string; query: [string, string][] } {
   let value = input.trim();
   if (/^[a-z][a-z0-9+.-]*:/i.test(value) || value.startsWith("//")) {
     throw new Error(`path must be a REST route such as /wp/v2/posts, not a URL: "${input}"`);
@@ -499,7 +546,9 @@ export function parseRoute(input: string): { route: string; query: Record<string
     throw new Error(`path may not contain "." or ".." segments: "${input}"`);
   }
 
-  return { route: value, query: Object.fromEntries(new URLSearchParams(search)) };
+  // Pairs, not an object: a key may repeat (`include[]=1&include[]=2`), and
+  // collapsing it would keep only the last value.
+  return { route: value, query: [...new URLSearchParams(search)] };
 }
 
 export type RestMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
@@ -518,14 +567,18 @@ export const rest = {
     path: string,
     options: { query?: QueryParams; body?: unknown } = {},
   ): Promise<RestResponse> => {
-    const { route, query } = parseRoute(path);
+    const { route, query: inline } = parseRoute(path);
     const hasBody = options.body !== undefined;
     if (hasBody && (method === "GET" || method === "OPTIONS")) {
       throw new Error(`${method} requests cannot carry a body — pass the values in query instead`);
     }
+    // An explicit `query` wins over the same parameter written inline in the
+    // path, bracketed forms included: `query.include` replaces `include[]=…`.
+    const explicit = options.query ?? {};
+    const rawQuery = inline.filter(([key]) => !Object.hasOwn(explicit, key.replace(/\[.*$/, "")));
     const result = await exchange<unknown>(method, route, {
-      // An explicit `query` wins over the same key written inline in the path.
-      params: { ...query, ...options.query },
+      rawQuery,
+      params: explicit,
       headers: hasBody ? { "Content-Type": "application/json" } : {},
       body: hasBody ? JSON.stringify(options.body) : undefined,
     });

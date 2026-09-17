@@ -12,7 +12,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for the WordP
 - **Comments** — list, create, update, delete
 - **Users** — list, get current user
 - **Site Settings** — get and update
-- **Custom fields** — every create and update tool takes `meta` (Yoast SEO fields, ACF-registered fields, …)
+- **Custom fields** — the create and update tools for posts, pages, media, categories, tags and comments take `meta` (Yoast SEO fields, ACF-registered fields, …)
 - **Any REST route** — `wordpress_request` for custom post types, plugin APIs and anything else, with `get_endpoint_schema` to discover what a route accepts
 
 Every create and update tool declares every field WordPress core accepts on that route.
@@ -136,7 +136,9 @@ may sit inside a private network.
 
 ## Custom fields (`meta`)
 
-Every create and update tool takes `meta` — a **JSON object passed as a string**:
+The create and update tools for posts, pages, media, categories, tags and
+comments take `meta` — a **JSON object passed as a string**. (Site settings have
+no custom fields in WordPress, so `update_site_settings` does not.)
 
 ```jsonc
 // update_post
@@ -210,7 +212,7 @@ npm run build
 # End-to-end checks against a scratch WordPress site — they write posts, pages,
 # media, terms and comments, so never point them at a live one. The site needs
 # pretty permalinks (/wp-json/ does not route without them); the writes suite
-# also needs Yoast SEO active and scripts/fixtures/rest-meta.php in mu-plugins.
+# also needs Yoast SEO active and scripts/fixtures/smoke-mu-plugin.php in mu-plugins.
 export WP_API_URL=http://localhost:8099 WP_API_USERNAME=admin \
   WP_API_PASSWORD="xxxx xxxx xxxx xxxx xxxx xxxx"
 npm run smoke          # both suites
