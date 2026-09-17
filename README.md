@@ -6,12 +6,16 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for the WordP
 
 - **Posts** — list, get, create, update, delete
 - **Pages** — list, get, create, update, delete
-- **Media** — list, get, upload, update metadata, delete
+- **Media** — list, get, upload, update, delete
 - **Categories** — list, create, update, delete
 - **Tags** — list, create, update, delete
 - **Comments** — list, create, update, delete
 - **Users** — list, get current user
 - **Site Settings** — get and update
+- **Custom fields** — the create and update tools for posts, pages, media, categories, tags and comments take `meta` (Yoast SEO fields, ACF-registered fields, …)
+- **Any REST route** — `wordpress_request` for custom post types, plugin APIs and anything else, with `get_endpoint_schema` to discover what a route accepts
+
+Every create and update tool declares every field WordPress core accepts on that route.
 
 ## Requirements
 
@@ -83,7 +87,7 @@ Add to your `claude_desktop_config.json`:
 | `list_media` | List media library items |
 | `get_media` | Get a single media item |
 | `create_media` | Upload a file to the media library |
-| `update_media` | Update media metadata (alt text, caption, etc.) |
+| `update_media` | Update a media item's attributes |
 | `delete_media` | Permanently delete a media item |
 | `list_categories` | List categories |
 | `create_category` | Create a new category |
@@ -101,6 +105,8 @@ Add to your `claude_desktop_config.json`:
 | `get_current_user` | Get the authenticated user |
 | `get_site_settings` | Get site title, description, timezone, etc. |
 | `update_site_settings` | Update site settings |
+| `wordpress_request` | Call any REST route on the site (any method, query, JSON body) |
+| `get_endpoint_schema` | Describe a route: methods, arguments, and the meta keys it stores |
 
 ## Uploading media
 
@@ -128,16 +134,90 @@ itself allows), and a `source_url` must resolve to a public address — loopback
 private-range and link-local hosts are refused, since the server fetching them
 may sit inside a private network.
 
+## Custom fields (`meta`)
+
+The create and update tools for posts, pages, media, categories, tags and
+comments take `meta` — a **JSON object passed as a string**. (Site settings have
+no custom fields in WordPress, so `update_site_settings` does not.)
+
+```jsonc
+// update_post
+{
+  "id": 123,
+  "meta": "{\"_yoast_wpseo_focuskw\": \"ai summarizer\", \"_yoast_wpseo_title\": \"AI Summarizer for Research\", \"_yoast_wpseo_metadesc\": \"Turn papers into structured briefs.\"}"
+}
+```
+
+It is a string, not an object, because that is the one shape every model provider
+fills in reliably: Gemini's function calling cannot express an object with
+free-form keys and sends `{}`, silently dropping every value. Clients that pass a
+real object are accepted too. Values can be any JSON; `null` deletes a key.
+
+WordPress stores only meta keys **registered for the REST API** on the site, and
+skips any other key without an error. The tool checks what came back: when
+WordPress ignored a key, the result carries a second message naming it.
+`get_endpoint_schema` lists the keys a route stores under `meta_keys`.
+
+Keys starting with an underscore — Yoast's among them — are also protected: a
+site has to grant write permission when it registers them, or the write fails
+with `rest_cannot_update`. A minimal mu-plugin that exposes Yoast's three core
+fields:
+
+```php
+<?php
+add_action( 'init', function () {
+	foreach ( array( '_yoast_wpseo_focuskw', '_yoast_wpseo_title', '_yoast_wpseo_metadesc' ) as $key ) {
+		register_post_meta( '', $key, array(
+			'type'          => 'string',
+			'single'        => true,
+			'show_in_rest'  => true,
+			'auth_callback' => function ( $allowed, $meta_key, $post_id ) {
+				return current_user_can( 'edit_post', $post_id );
+			},
+		) );
+	}
+} );
+```
+
+## Any REST route
+
+`wordpress_request` calls any route under `/wp-json` on the configured site — custom
+post types, users, menus, templates, or plugin namespaces such as `yoast/v1`,
+`wc/v3` or ACF. `query` and `body` are JSON strings, for the same reason `meta` is:
+
+```jsonc
+{ "method": "GET",  "path": "/wp/v2/users/me", "query": "{\"context\": \"edit\"}" }
+{ "method": "GET",  "path": "/wp/v2/product", "query": "{\"per_page\": 20, \"_fields\": \"id,title,link\"}" }
+{ "method": "POST", "path": "/wp/v2/posts/123", "body": "{\"excerpt\": \"New\", \"meta\": {\"key\": \"value\"}}" }
+```
+
+It returns `{status, total, total_pages, body}` (the totals appear on paginated
+lists), and WordPress's own error for anything that fails. The path must be a
+route on this site's REST API: full URLs and `.`/`..` segments are refused, so the
+credentials never reach anything outside `/wp-json`. It can do whatever the
+WordPress user can — with an administrator's application password that includes
+managing plugins, users and settings — so connect a user whose role matches what
+you want an assistant to be able to change.
+
+`get_endpoint_schema` answers the question to ask first: what does this route
+accept? It returns each method's arguments, the meta keys the route stores, and —
+for `/` or a namespace such as `/wp/v2` — the routes that exist.
+
 ## Development
 
 ```bash
 npm install
 npm run build
 
-# End-to-end check against a scratch WordPress site (it writes media and one
-# draft post, and needs pretty permalinks enabled for /wp-json/ to route):
-WP_API_URL=http://localhost:8099 WP_API_USERNAME=admin \
-  WP_API_PASSWORD="xxxx xxxx xxxx xxxx xxxx xxxx" npm run smoke:media
+# End-to-end checks against a scratch WordPress site — they write posts, pages,
+# media, terms and comments, so never point them at a live one. The site needs
+# pretty permalinks (/wp-json/ does not route without them); the writes suite
+# also needs Yoast SEO active and scripts/fixtures/smoke-mu-plugin.php in mu-plugins.
+export WP_API_URL=http://localhost:8099 WP_API_USERNAME=admin \
+  WP_API_PASSWORD="xxxx xxxx xxxx xxxx xxxx xxxx"
+npm run smoke          # both suites
+npm run smoke:media    # uploads only
+npm run smoke:writes   # create/update fields, meta, wordpress_request
 ```
 
 ## License

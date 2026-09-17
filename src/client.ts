@@ -8,7 +8,7 @@
 
 import type { ResolvedFile } from "./upload.js";
 
-export const USER_AGENT = "mcp-wordpress/1.1";
+export const USER_AGENT = "mcp-wordpress/1.2";
 
 export class WordPressError extends Error {
   constructor(
@@ -35,25 +35,68 @@ function getConfig(): { baseUrl: string; authHeader: string } {
   return { baseUrl, authHeader };
 }
 
-type QueryParams = Record<string, string | number | boolean | undefined>;
+/** Query values may nest: `{ include: [1, 2] }` and `{ meta: { k: "v" } }`
+ *  go out in the bracket syntax PHP parses back into arrays. */
+type QueryParams = Record<string, unknown>;
 
 interface SendOptions {
+  /** Query pairs sent exactly as written, ahead of `params` — a caller's
+   *  inline query string, where a key may repeat (`include[]=1&include[]=2`). */
+  rawQuery?: [string, string][];
   params?: QueryParams;
   body?: string | Uint8Array;
   /** Merged over the defaults, so an upload can replace `Content-Type`. */
   headers?: Record<string, string>;
 }
 
-async function send<T>(method: string, path: string, options: SendOptions = {}): Promise<T> {
+interface Exchange<T> {
+  status: number;
+  headers: Headers;
+  body: T;
+}
+
+function appendQuery(search: URLSearchParams, key: string, value: unknown): void {
+  if (value === undefined) return;
+  if (Array.isArray(value)) {
+    for (const item of value) appendQuery(search, `${key}[]`, item);
+  } else if (value !== null && typeof value === "object") {
+    for (const [sub, item] of Object.entries(value)) appendQuery(search, `${key}[${sub}]`, item);
+  } else {
+    search.append(key, value === null ? "" : String(value));
+  }
+}
+
+const MAX_REDIRECTS = 5;
+
+/**
+ * Whether a URL belongs to the configured site's REST API: same host and port,
+ * the same scheme or an upgrade from http to https, and a path under /wp-json.
+ * The credentials are sent to such a URL and to nothing else.
+ */
+function isRestUrl(target: URL, root: URL): boolean {
+  const scheme = target.protocol === root.protocol || (root.protocol === "http:" && target.protocol === "https:");
+  return (
+    scheme &&
+    target.hostname === root.hostname &&
+    target.port === root.port &&
+    target.pathname.startsWith(`${root.pathname}/`)
+  );
+}
+
+/** One authenticated round trip to a route under `/wp-json`, throwing a
+ *  {@link WordPressError} for any non-2xx answer. */
+async function exchange<T>(method: string, route: string, options: SendOptions = {}): Promise<Exchange<T>> {
   const { baseUrl, authHeader } = getConfig();
 
-  let url = `${baseUrl}/wp-json/wp/v2${path}`;
-  if (options.params) {
-    const qs = Object.entries(options.params)
-      .filter(([, v]) => v !== undefined)
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-      .join("&");
-    if (qs) url += `?${qs}`;
+  const root = new URL(`${baseUrl}/wp-json`);
+  let url = new URL(`${root.href}${route}`);
+  const search = new URLSearchParams(options.rawQuery ?? []);
+  for (const [key, value] of Object.entries(options.params ?? {})) appendQuery(search, key, value);
+  url.search = search.toString();
+  // `parseRoute` refuses dot segments; this catches anything that still
+  // resolves outside /wp-json once the URL is normalised.
+  if (!isRestUrl(url, root)) {
+    throw new Error(`route "${route}" resolves outside the REST API`);
   }
 
   const headers: Record<string, string> = {
@@ -62,13 +105,44 @@ async function send<T>(method: string, path: string, options: SendOptions = {}):
     ...options.headers,
   };
 
-  const response = await fetch(url, {
-    method,
-    headers,
-    // A Uint8Array is a valid body at runtime; the DOM lib types `BufferSource`
-    // as ArrayBuffer-backed only, which `Uint8Array<ArrayBufferLike>` is not.
-    body: options.body as BodyInit | undefined,
-  });
+  // Redirects are followed by hand. `fetch` would follow them itself and keep
+  // the Authorization header on any same-origin hop — to /wp-admin or
+  // /wp-login.php as readily as to another REST route.
+  let response: Response;
+  for (let hops = 0; ; hops++) {
+    response = await fetch(url, {
+      method,
+      headers,
+      // A Uint8Array is a valid body at runtime; the DOM lib types `BufferSource`
+      // as ArrayBuffer-backed only, which `Uint8Array<ArrayBufferLike>` is not.
+      body: options.body as BodyInit | undefined,
+      redirect: "manual",
+    });
+    const location = response.headers.get("location");
+    if (response.status < 300 || response.status >= 400 || location === null) break;
+
+    await response.body?.cancel().catch(() => {
+      /* the redirect's own body is never read */
+    });
+    const next = new URL(location, url);
+    const shown = `${next.origin}${next.pathname}`;
+    if (!isRestUrl(next, root)) {
+      throw new Error(
+        `${method} ${route} redirected to ${shown}, outside this site's REST API — not followed, so the credentials were not sent there. If the site has moved, set WP_API_URL to its new address.`,
+      );
+    }
+    // 301, 302 and 303 turn a write into a GET and drop its body: following
+    // one would report the GET's answer as if the write had happened.
+    if (response.status !== 307 && response.status !== 308 && !["GET", "HEAD", "OPTIONS"].includes(method)) {
+      throw new Error(
+        `${method} ${route} answered ${response.status} with a redirect to ${shown}; following it would resend the request as a GET without its body, so nothing was written. Set WP_API_URL to the address the site redirects to.`,
+      );
+    }
+    if (hops >= MAX_REDIRECTS) {
+      throw new Error(`${method} ${route} redirected more than ${MAX_REDIRECTS} times`);
+    }
+    url = next;
+  }
 
   const text = await response.text();
   let json: unknown;
@@ -86,7 +160,12 @@ async function send<T>(method: string, path: string, options: SendOptions = {}):
     throw new WordPressError(msg, response.status, json);
   }
 
-  return json as T;
+  return { status: response.status, headers: response.headers, body: json as T };
+}
+
+/** A round trip to a core `wp/v2` route, returning just the decoded body. */
+async function send<T>(method: string, path: string, options: SendOptions = {}): Promise<T> {
+  return (await exchange<T>(method, `/wp/v2${path}`, options)).body;
 }
 
 /** JSON in, JSON out — the shape every endpoint but the media upload uses. */
@@ -122,6 +201,10 @@ export interface Post {
   sticky: boolean;
 }
 
+/** Registered meta, keyed by meta key. WordPress saves only keys registered
+ *  with `show_in_rest`; `null` deletes a key. */
+export type MetaInput = Record<string, unknown>;
+
 export interface PostInput {
   title?: string;
   content?: string;
@@ -133,10 +216,14 @@ export interface PostInput {
   tags?: number[];
   featured_media?: number;
   comment_status?: "open" | "closed";
+  ping_status?: "open" | "closed";
   sticky?: boolean;
   date?: string;
+  date_gmt?: string;
   password?: string;
   format?: string;
+  template?: string;
+  meta?: MetaInput;
 }
 
 export interface ListPostsParams {
@@ -186,7 +273,12 @@ export interface PageInput {
   menu_order?: number;
   featured_media?: number;
   comment_status?: "open" | "closed";
+  ping_status?: "open" | "closed";
   date?: string;
+  date_gmt?: string;
+  password?: string;
+  template?: string;
+  meta?: MetaInput;
 }
 
 export const pages = {
@@ -214,6 +306,8 @@ export interface Media {
   link: string;
 }
 
+/** The scalar attributes an upload can carry as query parameters. `meta` is
+ *  not among them — see {@link MediaInput}. */
 export interface MediaMetadata {
   title?: string;
   alt_text?: string;
@@ -222,6 +316,18 @@ export interface MediaMetadata {
   /** Post or page ID to attach the file to. */
   post?: number;
   author?: number;
+  comment_status?: "open" | "closed";
+  ping_status?: "open" | "closed";
+  date?: string;
+  date_gmt?: string;
+  featured_media?: number;
+  slug?: string;
+  status?: "publish" | "draft" | "pending" | "private" | "future";
+  template?: string;
+}
+
+export interface MediaInput extends MediaMetadata {
+  meta?: MetaInput;
 }
 
 export const media = {
@@ -246,7 +352,7 @@ export const media = {
       },
       body: file.bytes,
     }),
-  update: (id: number, data: { title?: string; alt_text?: string; caption?: string; description?: string }) =>
+  update: (id: number, data: MediaInput) =>
     request<Media>("POST", `/media/${id}`, data),
   delete: (id: number, force = false) => request<{ deleted: boolean }>("DELETE", `/media/${id}`, undefined, { force }),
 };
@@ -263,13 +369,24 @@ export interface Category {
   link: string;
 }
 
+export interface TermInput {
+  name?: string;
+  slug?: string;
+  description?: string;
+  meta?: MetaInput;
+}
+
+export interface CategoryInput extends TermInput {
+  parent?: number;
+}
+
 export const categories = {
   list: (params?: { page?: number; per_page?: number; search?: string; parent?: number }) =>
     request<Category[]>("GET", "/categories", undefined, params as Record<string, string | number | boolean | undefined>),
   get: (id: number) => request<Category>("GET", `/categories/${id}`),
-  create: (data: { name: string; slug?: string; description?: string; parent?: number }) =>
+  create: (data: CategoryInput) =>
     request<Category>("POST", "/categories", data),
-  update: (id: number, data: { name?: string; slug?: string; description?: string; parent?: number }) =>
+  update: (id: number, data: CategoryInput) =>
     request<Category>("POST", `/categories/${id}`, data),
   delete: (id: number, force = false) => request<{ deleted: boolean }>("DELETE", `/categories/${id}`, undefined, { force }),
 };
@@ -289,9 +406,9 @@ export const tags = {
   list: (params?: { page?: number; per_page?: number; search?: string }) =>
     request<Tag[]>("GET", "/tags", undefined, params as Record<string, string | number | boolean | undefined>),
   get: (id: number) => request<Tag>("GET", `/tags/${id}`),
-  create: (data: { name: string; slug?: string; description?: string }) =>
+  create: (data: TermInput) =>
     request<Tag>("POST", "/tags", data),
-  update: (id: number, data: { name?: string; slug?: string; description?: string }) =>
+  update: (id: number, data: TermInput) =>
     request<Tag>("POST", `/tags/${id}`, data),
   delete: (id: number, force = false) => request<{ deleted: boolean }>("DELETE", `/tags/${id}`, undefined, { force }),
 };
@@ -336,13 +453,29 @@ export interface Comment {
   link: string;
 }
 
+export interface CommentInput {
+  post?: number;
+  parent?: number;
+  content?: string;
+  status?: string;
+  author?: number;
+  author_name?: string;
+  author_email?: string;
+  author_url?: string;
+  author_ip?: string;
+  author_user_agent?: string;
+  date?: string;
+  date_gmt?: string;
+  meta?: MetaInput;
+}
+
 export const comments = {
   list: (params?: { page?: number; per_page?: number; post?: number; status?: string }) =>
     request<Comment[]>("GET", "/comments", undefined, params as Record<string, string | number | boolean | undefined>),
   get: (id: number) => request<Comment>("GET", `/comments/${id}`),
-  create: (data: { post: number; content: string; author_name?: string; author_email?: string; parent?: number }) =>
+  create: (data: CommentInput) =>
     request<Comment>("POST", "/comments", data),
-  update: (id: number, data: { content?: string; status?: string }) =>
+  update: (id: number, data: CommentInput) =>
     request<Comment>("POST", `/comments/${id}`, data),
   delete: (id: number, force = false) => request<{ deleted: boolean }>("DELETE", `/comments/${id}`, undefined, { force }),
 };
@@ -363,9 +496,105 @@ export interface SiteSettings {
   default_category: number;
   default_post_format: string;
   posts_per_page: number;
+  show_on_front: string;
+  page_on_front: number;
+  page_for_posts: number;
+  default_comment_status: "open" | "closed";
+  default_ping_status: "open" | "closed";
+  site_logo: number;
+  site_icon: number;
 }
 
 export const settings = {
   get: () => request<SiteSettings>("GET", "/settings"),
   update: (data: Partial<SiteSettings>) => request<SiteSettings>("POST", "/settings", data),
+};
+
+// ── Any REST route ─────────────────────────────────────────────────────────
+
+/**
+ * Normalises a caller's route: tolerates a leading `/wp-json` and an inline
+ * query string (returned separately), refuses full URLs and dot segments —
+ * the site and its credentials are fixed, and so is the API they reach.
+ */
+export function parseRoute(input: string): { route: string; query: [string, string][] } {
+  let value = input.trim();
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value) || value.startsWith("//")) {
+    throw new Error(`path must be a REST route such as /wp/v2/posts, not a URL: "${input}"`);
+  }
+  if (value.includes("\\")) throw new Error(`path may not contain backslashes: "${input}"`);
+
+  const hash = value.indexOf("#");
+  if (hash >= 0) value = value.slice(0, hash);
+  let search = "";
+  const question = value.indexOf("?");
+  if (question >= 0) {
+    search = value.slice(question + 1);
+    value = value.slice(0, question);
+  }
+
+  if (!value.startsWith("/")) value = `/${value}`;
+  value = value.replace(/^\/wp-json(?=\/|$)/, "") || "/";
+
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    throw new Error(`path is not validly percent-encoded: "${input}"`);
+  }
+  if (decoded.split("/").some((segment) => segment === "." || segment === "..")) {
+    throw new Error(`path may not contain "." or ".." segments: "${input}"`);
+  }
+
+  // Pairs, not an object: a key may repeat (`include[]=1&include[]=2`), and
+  // collapsing it would keep only the last value.
+  return { route: value, query: [...new URLSearchParams(search)] };
+}
+
+export type RestMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
+
+export interface RestResponse {
+  status: number;
+  /** X-WP-Total / X-WP-TotalPages, present on paginated collections. */
+  total?: number;
+  total_pages?: number;
+  body: unknown;
+}
+
+export const rest = {
+  request: async (
+    method: RestMethod,
+    path: string,
+    options: { query?: QueryParams; body?: unknown } = {},
+  ): Promise<RestResponse> => {
+    const { route, query: inline } = parseRoute(path);
+    const hasBody = options.body !== undefined;
+    if (hasBody && (method === "GET" || method === "OPTIONS")) {
+      throw new Error(`${method} requests cannot carry a body — pass the values in query instead`);
+    }
+    // An explicit `query` wins over the same parameter written inline in the
+    // path, bracketed forms included: `query.include` replaces `include[]=…`.
+    const explicit = options.query ?? {};
+    const rawQuery = inline.filter(([key]) => !Object.hasOwn(explicit, key.replace(/\[.*$/, "")));
+    const result = await exchange<unknown>(method, route, {
+      rawQuery,
+      params: explicit,
+      headers: hasBody ? { "Content-Type": "application/json" } : {},
+      body: hasBody ? JSON.stringify(options.body) : undefined,
+    });
+    const total = result.headers.get("x-wp-total");
+    const totalPages = result.headers.get("x-wp-totalpages");
+    return {
+      status: result.status,
+      ...(total !== null ? { total: Number(total) } : {}),
+      ...(totalPages !== null ? { total_pages: Number(totalPages) } : {}),
+      body: result.body,
+    };
+  },
+
+  /** The route's OPTIONS answer: its methods, their arguments, its schema. */
+  describe: async (path: string): Promise<unknown> => {
+    const { route } = parseRoute(path);
+    return (await exchange<unknown>("OPTIONS", route)).body;
+  },
 };

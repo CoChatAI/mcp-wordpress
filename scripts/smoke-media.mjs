@@ -1,80 +1,24 @@
 /**
- * Media smoke test: drives the built server over stdio exactly as a client
- * does — one JSON-RPC message per line — and uploads real files to a real
- * WordPress site.
+ * Media smoke test: uploads real files to a real WordPress site through the
+ * built server (see harness.mjs).
  *
  *   npm run build
  *   WP_API_URL=http://localhost:8099 WP_API_USERNAME=admin \
  *     WP_API_PASSWORD="xxxx xxxx xxxx" node scripts/smoke-media.mjs
  *
  * It WRITES to the target site (media items and one draft post), so point it
- * at a scratch install, never a live one. The site needs pretty permalinks —
- * `/wp-json/` is not routed without them.
+ * at a scratch install, never a live one.
  */
-import { spawn } from "node:child_process";
-import { createInterface } from "node:readline";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { startServer, createChecks, importDist } from "./harness.mjs";
 
-for (const key of ["WP_API_URL", "WP_API_USERNAME", "WP_API_PASSWORD"]) {
-  if (!process.env[key]) {
-    console.error(`${key} is required`);
-    process.exit(2);
-  }
-}
-
-const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const child = spawn("node", [join(repoRoot, "dist/index.js")], {
-  env: process.env,
-  stdio: ["pipe", "pipe", "pipe"],
-});
-child.stderr.on("data", (d) => process.stderr.write(`[server] ${d}`));
-
-const pending = new Map();
-createInterface({ input: child.stdout }).on("line", (line) => {
-  if (!line.trim()) return;
-  const msg = JSON.parse(line);
-  const resolve = pending.get(msg.id);
-  if (resolve) {
-    pending.delete(msg.id);
-    resolve(msg);
-  }
-});
-
-let nextId = 1;
-function rpc(method, params) {
-  const id = nextId++;
-  return new Promise((resolve, reject) => {
-    pending.set(id, resolve);
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-    setTimeout(() => reject(new Error(`timeout on ${method}`)), 60_000).unref();
-  });
-}
-
-const callText = async (name, args) => {
-  const res = await rpc("tools/call", { name, arguments: args });
-  if (res.error) return `RPC ERROR: ${JSON.stringify(res.error)}`;
-  return res.result.content.map((c) => c.text).join("\n");
-};
-
-const results = [];
-const check = (label, pass, detail = "") => {
-  results.push({ label, pass });
-  console.log(`${pass ? "PASS" : "FAIL"}  ${label}${detail ? ` — ${detail}` : ""}`);
-};
+const { init, rpc, callText, stop } = await startServer();
+const { check, finish } = createChecks();
 
 // 1x1 red PNG.
 const PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-const init = await rpc("initialize", {
-  protocolVersion: "2024-11-05",
-  capabilities: {},
-  clientInfo: { name: "drive", version: "0" },
-});
 check("initialize", init.result?.serverInfo?.name === "mcp-wordpress", JSON.stringify(init.result?.serverInfo));
-child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
 const tools = await rpc("tools/list", {});
 const names = tools.result.tools.map((t) => t.name);
@@ -158,7 +102,7 @@ try {
 // name has to answer instead. No CDN serves a PNG that way on purpose, so this
 // asks an echo service for exactly those headers and checks the resolver
 // directly — the body is not a PNG, so it never goes to WordPress.
-const { resolveSource } = await import(pathToFileURL(join(repoRoot, "dist/upload.js")).href);
+const { resolveSource } = await importDist("upload.js");
 try {
   const resolved = await resolveSource({
     source_url:
@@ -215,7 +159,5 @@ check("adds the extension a bare filename lacks", /no-extension(-\d+)?\.png$/.te
 const exe = await callText("create_media", { data_base64: PNG_B64, filename: "payload.exe", mime_type: "image/png" });
 check("WordPress still gates the file type", /not permitted|Sorry/i.test(exe), exe.slice(0, 200));
 
-child.kill();
-const failed = results.filter((r) => !r.pass);
-console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
-process.exit(failed.length ? 1 : 0);
+stop();
+process.exit(finish());
